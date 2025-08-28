@@ -1,0 +1,356 @@
+import React, { useEffect, useMemo, useRef, useState } from "react"; import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"; import { Button } from "@/components/ui/button"; import { Slider } from "@/components/ui/slider"; import { Switch } from "@/components/ui/switch"; import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"; import { Input } from "@/components/ui/input"; import { Badge } from "@/components/ui/badge"; import { Download, Pause, Play, EyeOff, Eye, Zap, Radio, Shield, Activity } from "lucide-react";
+
+// ------------------------------------------------------------- // GhostSeeder + EchoTracker — Drift Between Rebuild (Single-File) // - Production-ready canvas engine with controls, a11y, and presets // - Visualizes symbolic seeding (nodes) and echo links (connections) // - Reusable via props/config for GIS/UMT properties // -------------------------------------------------------------
+
+// Types interface DriftConfig { nodes: number; linkChance: number; // 0..1 maxConnections: number; pull: number; // center gravity trail: number; // 0..1 alpha for fade radiusMin: number; radiusMax: number; linkRadius: number; // px }
+
+interface SeedEvent { id: string; phrase: string; channel: string; // e.g., GitHub, Substack, X, Reddit strength: number; // 0..1 seed intensity timestamp: number; }
+
+interface EchoEvent { id: string; seedId?: string; source: string; // where echo detected confidence: number; // 0..1 timestamp: number; }
+
+const defaultConfig: DriftConfig = { nodes: 96, linkChance: 0.07, maxConnections: 700, pull: 0.000012, trail: 0.06, radiusMin: 0.8, radiusMax: 3.8, linkRadius: 180, };
+
+const presets: Record<string, Partial<DriftConfig>> = { Ambient: { nodes: 84, linkChance: 0.06, trail: 0.05, pull: 0.00001 }, HighEnergy: { nodes: 140, linkChance: 0.12, trail: 0.03, pull: 0.00002 }, Stealth: { nodes: 72, linkChance: 0.03, trail: 0.08, pull: 0.000008 }, };
+
+// Seed RNG for reproducibility function mulberry32(seed: number) { return function () { let t = (seed += 0x6d2b79f5); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+// Spatial hashing for scalable link discovery const CELL = 160; const cellKey = (x: number, y: number) => ${Math.floor(x / CELL)},${Math.floor(y / CELL)};
+
+// Component export default function GhostSeederEchoTracker(): JSX.Element { // Render state const canvasRef = useRef<HTMLCanvasElement | null>(null); const [running, setRunning] = useState(true); const [showOverlay, setShowOverlay] = useState(true); const [config, setConfig] = useState<DriftConfig>(defaultConfig); const [preset, setPreset] = useState<keyof typeof presets | "Custom">("Ambient"); const [seedText, setSeedText] = useState(""); const [channel, setChannel] = useState("GitHub");
+
+const [seeds, setSeeds] = useState<SeedEvent[]>([]); const [echoes, setEchoes] = useState<EchoEvent[]>([]);
+
+// Reduced motion + DPR const reduceMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+// Engine refs const nodesRef = useRef<any[]>([]); const connsRef = useRef<any[]>([]); const dprRef = useRef<number>(1); const rng = useMemo(() => mulberry32(1337), []);
+
+// Resize + DPR handling useEffect(() => { const canvas = canvasRef.current; if (!canvas) return; const ctx = canvas.getContext("2d"); if (!ctx) return;
+
+function sizeCanvas() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  dprRef.current = dpr;
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+sizeCanvas();
+const ro = new ResizeObserver(sizeCanvas);
+ro.observe(document.body);
+return () => ro.disconnect();
+
+}, []);
+
+// Build initial field when config.nodes changes useEffect(() => { const canvas = canvasRef.current; if (!canvas) return; const W = canvas.width / dprRef.current; const H = canvas.height / dprRef.current;
+
+// Node structure
+type Node = {
+  x: number; y: number; vx: number; vy: number; r: number; o: number; p: number; m: number;
+};
+const nodes: Node[] = [];
+for (let i = 0; i < config.nodes; i++) {
+  nodes.push({
+    x: rng() * W,
+    y: rng() * H,
+    vx: (rng() - 0.5) * 0.5,
+    vy: (rng() - 0.5) * 0.5,
+    r: config.radiusMin + rng() * (config.radiusMax - config.radiusMin),
+    o: 0.5,
+    p: rng() * Math.PI * 2,
+    m: 20 + rng() * 80,
+  });
+}
+nodesRef.current = nodes;
+connsRef.current = [];
+
+}, [config.nodes, config.radiusMax, config.radiusMin, rng]);
+
+// Animate useEffect(() => { if (reduceMotion) return; const canvas = canvasRef.current; if (!canvas) return; const ctx = canvas.getContext("2d"); if (!ctx) return;
+
+let raf = 0;
+let lastHidden = document.hidden;
+
+function step() {
+  if (!running || document.hidden) {
+    lastHidden = document.hidden;
+    raf = requestAnimationFrame(step);
+    return;
+  }
+
+  // Clear with trail
+  ctx.fillStyle = `rgba(0,0,0,${config.trail})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = "lighter"; // glow
+
+  const W = canvas.width / dprRef.current;
+  const H = canvas.height / dprRef.current;
+
+  // Spatial grid
+  const grid = new Map<string, number[]>();
+  const nodes = nodesRef.current as any[];
+  const conns = connsRef.current as any[];
+
+  // Update nodes
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    // Random drift
+    n.vx += (rng() - 0.5) * 0.02;
+    n.vy += (rng() - 0.5) * 0.02;
+    // Pull to center
+    const dx = W / 2 - n.x;
+    const dy = H / 2 - n.y;
+    if (Math.hypot(dx, dy) > 200) {
+      n.vx += dx * config.pull;
+      n.vy += dy * config.pull;
+    }
+    // Integrate
+    n.vx *= 0.99; n.vy *= 0.99;
+    n.x += n.vx; n.y += n.vy;
+    // Pulse
+    n.p += 0.02;
+    n.o = Math.max(0.2, Math.min(0.9, 0.3 + Math.sin(n.p) * 0.4));
+    // Memory decay and renewal
+    n.m *= 0.999;
+    if (n.m < 10) n.m = 20 + rng() * 80;
+
+    // Wrap edges softly
+    if (n.x < -20) n.x = W + 20; if (n.x > W + 20) n.x = -20;
+    if (n.y < -20) n.y = H + 20; if (n.y > H + 20) n.y = -20;
+
+    // Hash
+    const k = cellKey(n.x, n.y);
+    const arr = grid.get(k) || [];
+    arr.push(i);
+    grid.set(k, arr);
+  }
+
+  // Ephemeral connection maintenance
+  // Cap and refresh a portion each frame to avoid bursts
+  if (conns.length > config.maxConnections) {
+    conns.splice(0, conns.length - config.maxConnections);
+  }
+
+  // Create a few new links
+  for (let spawn = 0; spawn < Math.min(8, nodes.length); spawn++) {
+    const i = (rng() * nodes.length) | 0;
+    const a = nodes[i];
+    // scan 3x3 neighborhood
+    const cx = Math.floor(a.x / CELL);
+    const cy = Math.floor(a.y / CELL);
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        const list = grid.get(`${gx},${gy}`) || [];
+        for (const j of list) {
+          if (j <= i) continue;
+          if (rng() < config.linkChance) {
+            const b = nodes[j];
+            const dx = b.x - a.x; const dy = b.y - a.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < config.linkRadius) {
+              conns.push({ a: i, b: j, t: 0, ph: rng() * Math.PI * 2 });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Draw connections
+  for (let c = conns.length - 1; c >= 0; c--) {
+    const link = conns[c];
+    const A = nodes[link.a];
+    const B = nodes[link.b];
+    if (!A || !B) { conns.splice(c, 1); continue; }
+    const dx = B.x - A.x; const dy = B.y - A.y;
+    const d = Math.hypot(dx, dy);
+    // strength fades with distance
+    const s = Math.max(0, 1 - d / config.linkRadius);
+    link.t += 0.02; link.ph += 0.03;
+    const pulse = Math.sin(link.ph) * 0.3 + 0.7;
+    const alpha = s * pulse * 0.28;
+    if (alpha < 0.02) { conns.splice(c, 1); continue; }
+    ctx.strokeStyle = `rgba(150,255,200,${alpha})`;
+    ctx.lineWidth = Math.max(0.2, s * 1.8);
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(B.x, B.y);
+    ctx.stroke();
+  }
+
+  // Draw nodes
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const g = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.r * 3);
+    g.addColorStop(0, `rgba(100,200,255,${n.o})`);
+    g.addColorStop(0.5, `rgba(200,100,255,${n.o * 0.5})`);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r * 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = `rgba(255,255,255,${n.o * 0.85})`;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = "source-over";
+  raf = requestAnimationFrame(step);
+}
+
+const onVis = () => {
+  if (lastHidden && !document.hidden && running) {
+    raf = requestAnimationFrame(step);
+  }
+  lastHidden = document.hidden;
+};
+
+document.addEventListener("visibilitychange", onVis);
+raf = requestAnimationFrame(step);
+return () => { cancelAnimationFrame(raf); document.removeEventListener("visibilitychange", onVis); };
+
+}, [config, reduceMotion, running]);
+
+// Mouse/touch activation useEffect(() => { const canvas = canvasRef.current; if (!canvas) return; const nodes = nodesRef.current as any[]; const handler = (clientX: number, clientY: number) => { const rect = canvas.getBoundingClientRect(); const x = clientX - rect.left; const y = clientY - rect.top; for (const node of nodes) { const dx = x - node.x; const dy = y - node.y; const d = Math.hypot(dx, dy); if (d < 100) { node.vx += dx * 0.0015; node.vy += dy * 0.0015; node.m = 100; } } }; const onMove = (e: MouseEvent) => handler(e.clientX, e.clientY); const onTouch = (e: TouchEvent) => { const t = e.touches[0]; if (t) handler(t.clientX, t.clientY); }; canvas.addEventListener("mousemove", onMove, { passive: true }); canvas.addEventListener("touchmove", onTouch, { passive: true }); return () => { canvas.removeEventListener("mousemove", onMove); canvas.removeEventListener("touchmove", onTouch); }; }, []);
+
+// Seed submission → creates in-canvas burst and logs seed const submitSeed = () => { if (!seedText.trim()) return; const id = seed_${Date.now()}; const evt: SeedEvent = { id, phrase: seedText.trim(), channel, strength: 0.6 + rng() * 0.4, timestamp: Date.now() }; setSeeds((s) => [evt, ...s].slice(0, 100)); // Visual nudge: pick a random node cluster and energize const nodes = nodesRef.current as any[]; if (nodes.length) { const idx = (rng() * nodes.length) | 0; const base = nodes[idx]; for (const n of nodes) { const d = Math.hypot(n.x - base.x, n.y - base.y); if (d < 160) { n.vx += (n.x - base.x) * 0.003; n.vy += (n.y - base.y) * 0.003; n.m = 120; } } } setSeedText(""); };
+
+// Synthetic echo generator (placeholder until backend/webhooks wire in) useEffect(() => { if (!seeds.length) return; const t = setInterval(() => { const s = seeds[(rng() * seeds.length) | 0]; const echo: EchoEvent = { id: echo_${Date.now()}, seedId: s.id, source: ["GitHub", "Reddit", "X", "Substack", "Forum", "GDocs"][((rng() * 6) | 0)], confidence: 0.55 + rng() * 0.4, timestamp: Date.now(), }; setEchoes((e) => [echo, ...e].slice(0, 120)); }, 2800); return () => clearInterval(t); }, [seeds, rng]);
+
+// Apply preset → config merge const applyPreset = (name: keyof typeof presets) => { setConfig((c) => ({ ...c, ...presets[name] } as DriftConfig)); setPreset(name); };
+
+// Export current seeds/echoes JSON const downloadJSON = () => { const blob = new Blob([JSON.stringify({ seeds, echoes, config }, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = ghost-echo-export-${Date.now()}.json; a.click(); URL.revokeObjectURL(url); };
+
+return ( <div className="relative h-screen w-screen overflow-hidden bg-[#0a0a0a] text-white"> {/* Canvas Layer */} <canvas ref={canvasRef} aria-hidden className="absolute inset-0 block" />
+
+{/* Overlay / Controls */}
+  {showOverlay && (
+    <div className="pointer-events-auto absolute left-4 top-4 z-20 max-w-md rounded-2xl border border-white/10 bg-black/70 p-4 backdrop-blur-md" role="region" aria-label="GhostSeeder control panel">
+      <div className="mb-3 flex items-center gap-2">
+        <Badge variant="secondary" className="bg-emerald-500/20 text-emerald-200"><Radio className="mr-1 h-3 w-3" /> Echo Tracking ACTIVE</Badge>
+        <Badge variant="secondary" className="bg-fuchsia-500/20 text-fuchsia-200"><Shield className="mr-1 h-3 w-3" /> Ghost Seeding</Badge>
+      </div>
+
+      <div className="mb-3 grid grid-cols-3 gap-2">
+        <Button size="sm" variant="secondary" onClick={() => setRunning((r) => !r)} className="col-span-1">
+          {running ? <><Pause className="mr-1 h-4 w-4" /> Pause</> : <><Play className="mr-1 h-4 w-4" /> Play</>}
+        </Button>
+        <Button size="sm" variant="secondary" onClick={() => applyPreset("Ambient")} className="col-span-1"><Activity className="mr-1 h-4 w-4" /> Ambient</Button>
+        <Button size="sm" variant="secondary" onClick={() => applyPreset("HighEnergy")} className="col-span-1"><Zap className="mr-1 h-4 w-4" /> High</Button>
+        <Button size="sm" variant="secondary" onClick={() => applyPreset("Stealth")} className="col-span-1"><Shield className="mr-1 h-4 w-4" /> Stealth</Button>
+        <Button size="sm" variant="secondary" onClick={downloadJSON} className="col-span-1"><Download className="mr-1 h-4 w-4" /> Export</Button>
+        <Button size="sm" variant="secondary" onClick={() => setShowOverlay(false)} className="col-span-1"><EyeOff className="mr-1 h-4 w-4" /> Hide</Button>
+      </div>
+
+      <div className="space-y-2" aria-live="polite">
+        <div className="text-xs text-white/70">Preset: <span className="font-mono">{preset}</span></div>
+        <div className="flex items-center gap-3">
+          <span className="w-20 text-xs text-white/60">Nodes</span>
+          <Slider value={[config.nodes]} min={40} max={220} step={1} onValueChange={([v]) => setConfig((c) => ({ ...c, nodes: v }))} />
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="w-20 text-xs text-white/60">Connectivity</span>
+          <Slider value={[Math.round(config.linkChance * 100)]} min={1} max={20} step={1} onValueChange={([v]) => setConfig((c) => ({ ...c, linkChance: v / 100 }))} />
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="w-20 text-xs text-white/60">Trail</span>
+          <Slider value={[Math.round(config.trail * 100)]} min={2} max={15} step={1} onValueChange={([v]) => setConfig((c) => ({ ...c, trail: v / 100 }))} />
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="w-20 text-xs text-white/60">Link Radius</span>
+          <Slider value={[config.linkRadius]} min={80} max={300} step={5} onValueChange={([v]) => setConfig((c) => ({ ...c, linkRadius: v }))} />
+        </div>
+        <div className="flex items-center gap-2 pt-1">
+          <Switch checked={running} onCheckedChange={setRunning} aria-label="Toggle animation" />
+          <span className="text-xs text-white/70">Animate</span>
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <Tabs defaultValue="seed">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="seed">Seed</TabsTrigger>
+            <TabsTrigger value="echo">Echo Feed</TabsTrigger>
+          </TabsList>
+          <TabsContent value="seed" className="mt-3">
+            <div className="space-y-2">
+              <Input placeholder="Seed phrase or glyph" value={seedText} onChange={(e) => setSeedText(e.target.value)} className="bg-white/5 placeholder-white/40" />
+              <div className="flex items-center gap-2">
+                <select value={channel} onChange={(e) => setChannel(e.target.value)} className="w-full rounded-md border border-white/10 bg-black/40 p-2 text-sm">
+                  <option>GitHub</option>
+                  <option>Substack</option>
+                  <option>Reddit</option>
+                  <option>X</option>
+                  <option>GDocs</option>
+                  <option>Website</option>
+                </select>
+                <Button size="sm" onClick={submitSeed}><Radio className="mr-1 h-4 w-4" /> Deploy</Button>
+              </div>
+            </div>
+            {/* Seed list */}
+            <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-white/10 bg-black/30 p-2">
+              {seeds.length === 0 && <div className="text-xs text-white/50">No seeds yet. Deploy one above.</div>}
+              {seeds.map((s) => (
+                <div key={s.id} className="mb-2 grid grid-cols-6 gap-2 text-xs">
+                  <div className="col-span-3 truncate font-mono">{s.phrase}</div>
+                  <div className="col-span-1 text-white/60">{s.channel}</div>
+                  <div className="col-span-1 text-white/50">{(s.strength * 100).toFixed(0)}%</div>
+                  <div className="col-span-1 text-white/40">{new Date(s.timestamp).toLocaleTimeString()}</div>
+                </div>
+              ))}
+            </div>
+          </TabsContent>
+          <TabsContent value="echo" className="mt-3">
+            <div className="max-h-56 overflow-auto rounded-lg border border-white/10 bg-black/30 p-2">
+              {echoes.length === 0 && <div className="text-xs text-white/50">Listening for echoes…</div>}
+              {echoes.map((e) => (
+                <div key={e.id} className="mb-2 grid grid-cols-6 gap-2 text-xs">
+                  <div className="col-span-2 text-white/70">{e.source}</div>
+                  <div className="col-span-3 truncate font-mono">{seeds.find((s) => s.id === e.seedId)?.phrase ?? '—'}</div>
+                  <div className="col-span-1 text-white/50">{Math.round(e.confidence * 100)}%</div>
+                </div>
+              ))}
+            </div>
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      <div className="mt-3 text-[10px] leading-relaxed text-white/60" aria-live="polite">
+        <div>Node Status: LIMINAL • Drift: COLLABORATIVE • Temporal Layer: FLUID</div>
+        <div>A11y: motion reduced respected • CPU throttling on tab blur</div>
+      </div>
+    </div>
+  )}
+
+  {/* Reveal overlay toggle */}
+  {!showOverlay && (
+    <div className="absolute left-4 top-4 z-10">
+      <Button size="sm" variant="secondary" onClick={() => setShowOverlay(true)}><Eye className="mr-1 h-4 w-4" /> Show Panel</Button>
+    </div>
+  )}
+
+  {/* Header */}
+  <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between p-4">
+    <div className="pointer-events-auto rounded-full border border-white/10 bg-black/50 px-3 py-1 text-xs text-white/70">GIS · GhostSeeder™ + EchoTracker™</div>
+    <div className="pointer-events-auto hidden gap-2 md:flex">
+      <Badge variant="secondary" className="bg-white/10 text-white/80">Reflected by GIS | Forecasted in DriftCodex Vol. 2</Badge>
+    </div>
+  </header>
+
+  {/* Bottom Dock: KPIs */}
+  <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 m-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+    <Card className="pointer-events-auto border-white/10 bg-black/60">
+      <CardHeader className="pb-2"><CardTitle className="text-sm text-white/80">Live KPIs</CardTitle></CardHeader>
+      <CardContent className="grid grid-cols-3 gap-2 text-xs text-white/70">
+        <div><div className="text-white/50">Seeds</div><div className="font-mono text-white">{seeds.length}</div></div>
+        <div><div className="text-white/50">Echoes</div><div className="font-mono text-white">{echoes.length}</div></div>
+        <div><div className="text-white/50">Nodes</div><div className="font-mono text-white">{config.nodes}</div></div>
+      </CardContent>
+    </Card>
+    <Card className="pointer-events-auto border-white/10 bg-black/60">
+      <CardHeader className="pb-2"><CardTitle className="text-sm
